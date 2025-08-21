@@ -20,7 +20,7 @@ public class AudioManager {
     private let enableAEC: Bool
     private var cancellables = Set<AnyCancellable>()
     private let targetSampleRate: Float64 = 24000
-
+    
     // Background Music Related
     
     private var queuePlayer: AVQueuePlayer = AVQueuePlayer()
@@ -28,9 +28,9 @@ public class AudioManager {
     private var playlistItems: [AVPlayerItem] = []
     private var musicPositionTimer: Timer?
     public var musicIsPlaying = false
-
+    
     public var eventSink: FlutterEventSink?
-
+    
     public init(
         channels: UInt32 = 1,
         sampleRate: Double = 48000,
@@ -46,47 +46,66 @@ public class AudioManager {
     ) {
         self.amplitudeThreshold = amplitudeThreshold
         self.enableAEC = enableAEC
-        
+
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(category, mode: mode, options: options)
+            // Prefer HFP when AEC is on; avoid A2DP
+            var sessionOptions = options
+            if enableAEC {
+                sessionOptions.remove(.allowBluetoothA2DP)
+                sessionOptions.insert(.allowBluetooth)
+            }
+
+            try session.setCategory(category, mode: mode, options: sessionOptions)
             try session.setPreferredSampleRate(preferredSampleRate)
             try session.setPreferredIOBufferDuration(preferredBufferDuration)
-            try session.setInputGain(1.0)
-            try session.setActive(true, options: [.notifyOthersOnDeactivation])
-            let appliedOptions = session.categoryOptions.rawValue
-            print("Audio session configured: sampleRate=\(session.sampleRate), channels=\(session.outputNumberOfChannels), inputGain=\(session.inputGain), options=\(appliedOptions), bufferDuration=\(session.ioBufferDuration)")
-            print("Expected options: defaultToSpeaker=8, mixWithOthers=32, allowBluetoothA2DP=4, Total=44")
-            if appliedOptions != 44 {
-                print("Warning: Options mismatch, expected 44, got \(appliedOptions)")
-                try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.defaultToSpeaker, .mixWithOthers, .allowBluetoothA2DP])
-                print("Fallback applied: options=\(session.categoryOptions.rawValue)")
+            if session.isInputGainSettable {
+                try session.setInputGain(1.0)
             }
+            try session.setActive(true, options: [.notifyOthersOnDeactivation])
+            print("Audio session configured: sr=\(session.sampleRate), outCh=\(session.outputNumberOfChannels), ioBuffer=\(session.ioBufferDuration), opts=\(session.categoryOptions.rawValue)")
         } catch {
             print("Failed to configure audio session: \(error)")
             errorPublisher.send("Audio session error: \(error.localizedDescription)")
         }
 
+        // ---- Initialize required stored formats with safe placeholders ----
+        let sr = session.sampleRate > 0 ? session.sampleRate : sampleRate
+
+        // Input: float32, interleaved, channel count from param
         self.inputFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
-            sampleRate: session.sampleRate,
-            channels: channels,
+            sampleRate: sr,
+            channels: AVAudioChannelCount(channels),
             interleaved: true
         )!
+
+        // Mixer/output working format placeholder: float32, non-interleaved, 2ch
         self.audioFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
-            sampleRate: session.sampleRate,
+            sampleRate: sr,
             channels: 2,
             interleaved: false
         )!
+
+        // Uplink/websocket format: int16 @ target sample rate, channels from param
         self.webSocketFormat = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
             sampleRate: targetSampleRate,
-            channels: channels,
+            channels: AVAudioChannelCount(channels),
             interleaved: true
         )!
-        setupConverters()
+
+        // Converters will be built after engine starts (in setupEngine)
+        self.recordingConverter = nil
+        self.playbackConverter  = nil
+
+        // setupEngine() will:
+        // - start the engine + enable voice processing
+        // - refresh inputFormat/audioFormat from actual hardware
+        // - rebuild converters via setupConverters()
     }
+
 
     private func setupConverters() {
         recordingConverter = AVAudioConverter(from: inputFormat, to: webSocketFormat)
@@ -102,20 +121,39 @@ public class AudioManager {
     }
 
     public func setupEngine() {
+        let session = AVAudioSession.sharedInstance()
+
+        // Attach nodes
         audioEngine.attach(playerNode)
-        audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: audioFormat)
-        audioEngine.connect(audioEngine.mainMixerNode, to: audioEngine.outputNode, format: audioFormat)
+
+        audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: nil)
         audioEngine.mainMixerNode.outputVolume = 1.0
 
-        let session = AVAudioSession.sharedInstance()
         do {
             try session.setActive(true)
+
+            // Enable voice processing (may change the input node’s actual format)
             if enableAEC {
                 try inputNode.setVoiceProcessingEnabled(true)
                 print("Voice processing enabled for AEC")
             }
+
             try audioEngine.start()
-            print("Audio engine started with outputFormat=\(audioFormat)")
+            print("Audio engine started")
+
+            // Refresh formats AFTER engine + voice processing are active
+            let mixer = audioEngine.mainMixerNode
+            self.inputFormat = inputNode.outputFormat(forBus: 0)
+            self.audioFormat = mixer.outputFormat(forBus: 0)
+            self.webSocketFormat = AVAudioFormat(
+                commonFormat: .pcmFormatInt16,
+                sampleRate: targetSampleRate,
+                channels: inputFormat.channelCount,
+                interleaved: true
+            )!
+
+            setupConverters()
+            print("Formats: input=\(inputFormat), mixer=\(audioFormat), ws=\(webSocketFormat)")
         } catch {
             print("Failed to start audio engine or enable AEC: \(error)")
             errorPublisher.send("Engine error: \(error.localizedDescription)")
@@ -124,6 +162,7 @@ public class AudioManager {
             }
         }
     }
+
 
     public func emitMusicIsPlaying() {
         DispatchQueue.main.async { [weak self] in
@@ -224,69 +263,81 @@ public class AudioManager {
     private func installRecordingTap() {
         let bus = 0
         inputNode.removeTap(onBus: bus)
-        inputNode.installTap(onBus: bus, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            guard let self = self, let converter = self.recordingConverter else {
-                self?.errorPublisher.send("Recording converter unavailable")
-                DispatchQueue.main.async { [weak self] in
-                    self?.eventSink?(["type": "error", "message": "Recording converter unavailable"])
+
+        // Use nil so the tap uses the node’s native (hardware) format
+        inputNode.installTap(onBus: bus, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
+            guard let self = self else { return }
+
+            // Rebuild converter if route/format changed
+            if self.recordingConverter == nil || self.recordingConverter?.inputFormat != buffer.format {
+                self.recordingConverter = AVAudioConverter(from: buffer.format, to: self.webSocketFormat)
+                if self.recordingConverter == nil {
+                    self.errorPublisher.send("Failed to init recording converter")
+                    DispatchQueue.main.async { self.eventSink?(["type":"error","message":"Failed to init recording converter"]) }
+                    return
                 }
-                return
             }
-            let amplitude = buffer.floatChannelData?.pointee.withMemoryRebound(to: Float.self, capacity: Int(buffer.frameLength)) { ptr in
-                (0..<Int(buffer.frameLength)).reduce(0.0) { max($0, abs(ptr[$1])) }
-            } ?? 0
+
+            guard let converter = self.recordingConverter else { return }
+
             let frameCapacity = UInt32(round(Double(buffer.frameLength) * converter.outputFormat.sampleRate / buffer.format.sampleRate))
-            guard let outputBuffer = AVAudioPCMBuffer(
-                pcmFormat: converter.outputFormat,
-                frameCapacity: frameCapacity
-            ) else {
-                self.errorPublisher.send("Failed to create output buffer")
-                DispatchQueue.main.async { [weak self] in
-                    self?.eventSink?(["type": "error", "message": "Failed to create output buffer"])
-                }
+            guard let out = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: frameCapacity) else {
+                DispatchQueue.main.async { self.eventSink?(["type":"error","message":"Failed to create output buffer"]) }
                 return
             }
-            var error: NSError?
-            let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
+
+            var convErr: NSError?
+            let status = converter.convert(to: out, error: &convErr) { _, outStatus in
                 outStatus.pointee = .haveData
                 return buffer
             }
-            if let error = error {
+            if let error = convErr {
                 self.errorPublisher.send("Recording conversion error: \(error.localizedDescription)")
-                DispatchQueue.main.async { [weak self] in
-                    self?.eventSink?(["type": "error", "message": "Recording conversion error: \(error.localizedDescription)"])
+                DispatchQueue.main.async {
+                    self.eventSink?(["type": "error", "message": "Recording conversion error: \(error.localizedDescription)"])
                 }
                 return
             }
             if status == .error {
                 self.errorPublisher.send("Recording conversion failed")
-                DispatchQueue.main.async { [weak self] in
-                    self?.eventSink?(["type": "error", "message": "Recording conversion failed"])
+                DispatchQueue.main.async {
+                    self.eventSink?(["type": "error", "message": "Recording conversion failed"])
                 }
                 return
             }
-            if let data = outputBuffer.int16ChannelData?.pointee {
-                let byteCount = Int(outputBuffer.frameLength) * MemoryLayout<Int16>.size * Int(outputBuffer.format.channelCount)
-                let audioData = Data(bytes: data, count: byteCount)
-                self.audioChunkPublisher.send(audioData)
+            
+            guard out.frameLength > 0 else { return }
+
+            if let ptr = out.int16ChannelData?.pointee {
+                let bytes = Int(out.frameLength) * MemoryLayout<Int16>.size * Int(out.format.channelCount)
+                self.audioChunkPublisher.send(Data(bytes: ptr, count: bytes))
             } else {
-                DispatchQueue.main.async { [weak self] in
-                    self?.eventSink?(["type": "error", "message": "No audio data in output buffer"])
-                }
+                DispatchQueue.main.async { self.eventSink?(["type":"error","message":"No audio data in output buffer"]) }
             }
         }
     }
 
+
     public func startRecording() -> AnyPublisher<Data, Never> {
-        guard !isRecording else {
-            print("Already recording")
-            return audioChunkPublisher.eraseToAnyPublisher()
-        }
+        guard !isRecording else { return audioChunkPublisher.eraseToAnyPublisher() }
         isRecording = true
-        print("Starting recording with format=\(webSocketFormat)")
+
+        // ✅ Defensive: ensure engine is running before installing the tap
+        if !audioEngine.isRunning {
+            do { try audioEngine.start() } catch {
+                errorPublisher.send("Engine start failed: \(error.localizedDescription)")
+                DispatchQueue.main.async { [weak self] in
+                    self?.eventSink?(["type":"error","message":"Engine start failed: \(error.localizedDescription)"])
+                }
+                return audioChunkPublisher.eraseToAnyPublisher()
+            }
+        }
+
+        print("Starting recording with wsFormat=\(webSocketFormat)")
         installRecordingTap()
         return audioChunkPublisher.eraseToAnyPublisher()
     }
+
 
     public func stopRecording() {
         guard isRecording else { return }
@@ -374,6 +425,11 @@ public class AudioManager {
             print("Engine stopped, attempting to restart")
             do {
                 try audioEngine.start()
+                //  Refresh formats; converters may be invalid after a route change
+                self.inputFormat = inputNode.outputFormat(forBus: 0)
+                self.audioFormat = audioEngine.mainMixerNode.outputFormat(forBus: 0)
+                setupConverters()
+
                 if isRecording {
                     print("Reinstalling recording tap")
                     installRecordingTap()
@@ -387,6 +443,7 @@ public class AudioManager {
             }
         }
     }
+
 
     public func isRecordingActive() -> Bool {
         return isRecording
