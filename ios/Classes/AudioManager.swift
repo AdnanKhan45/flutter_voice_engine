@@ -122,29 +122,27 @@ public class AudioManager {
 
     public func setupEngine() {
         let session = AVAudioSession.sharedInstance()
-
-        // Attach nodes
         audioEngine.attach(playerNode)
-
         audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: nil)
         audioEngine.mainMixerNode.outputVolume = 1.0
 
         do {
             try session.setActive(true)
-
-            // Enable voice processing (may change the input node’s actual format)
             if enableAEC {
                 try inputNode.setVoiceProcessingEnabled(true)
                 print("Voice processing enabled for AEC")
             }
-
             try audioEngine.start()
             print("Audio engine started")
 
             // Refresh formats AFTER engine + voice processing are active
-            let mixer = audioEngine.mainMixerNode
             self.inputFormat = inputNode.outputFormat(forBus: 0)
-            self.audioFormat = mixer.outputFormat(forBus: 0)
+
+            // ✅ Use the ACTUAL player node output format to avoid channel mismatches
+            let playerOutFormat = playerNode.outputFormat(forBus: 0)
+            self.audioFormat = playerOutFormat
+
+            // Uplink stays 16-bit mono@24k (or channels matching input if you kept that)
             self.webSocketFormat = AVAudioFormat(
                 commonFormat: .pcmFormatInt16,
                 sampleRate: targetSampleRate,
@@ -152,8 +150,9 @@ public class AudioManager {
                 interleaved: true
             )!
 
-            setupConverters()
-            print("Formats: input=\(inputFormat), mixer=\(audioFormat), ws=\(webSocketFormat)")
+            // Rebuild converters with the exact formats
+            setupConverters()                 // recordingConverter: input -> ws, playbackConverter: ws -> audioFormat
+            print("Formats: input=\(inputFormat), playerOut=\(playerOutFormat), ws=\(webSocketFormat)")
         } catch {
             print("Failed to start audio engine or enable AEC: \(error)")
             errorPublisher.send("Engine error: \(error.localizedDescription)")
@@ -162,7 +161,6 @@ public class AudioManager {
             }
         }
     }
-
 
     public func emitMusicIsPlaying() {
         DispatchQueue.main.async { [weak self] in
@@ -346,40 +344,55 @@ public class AudioManager {
         print("Recording stopped")
     }
 
-    public func playAudioChunk(audioData: Data) throws {
-        guard audioEngine.isRunning, let converter = playbackConverter else {
-            throw NSError(domain: "AudioManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "Engine or converter unavailable"])
-        }
-        print("Received playback chunk, size: \(audioData.count) bytes")
-        let frameCount = AVAudioFrameCount(audioData.count / (MemoryLayout<Int16>.size * Int(self.webSocketFormat.channelCount)))
-        guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: webSocketFormat, frameCapacity: frameCount) else {
-            throw NSError(domain: "AudioManager", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to create input buffer"])
-        }
-        inputBuffer.frameLength = frameCount
-        audioData.withUnsafeBytes { rawBuffer in
-            inputBuffer.int16ChannelData?.pointee.update(from: rawBuffer.baseAddress!.assumingMemoryBound(to: Int16.self), count: Int(frameCount * webSocketFormat.channelCount))
-        }
-        let outputFrameCapacity = UInt32(round(Double(frameCount) * audioFormat.sampleRate / webSocketFormat.sampleRate))
-        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: AVAudioFrameCount(outputFrameCapacity)) else {
-            throw NSError(domain: "AudioManager", code: -4, userInfo: [NSLocalizedDescriptionKey: "Failed to create output buffer"])
-        }
-        var error: NSError?
-        let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
-            outStatus.pointee = .haveData
-            return inputBuffer
-        }
-        if let error = error {
-            throw error
-        }
-        if status == .error {
-            throw NSError(domain: "AudioManager", code: -5, userInfo: [NSLocalizedDescriptionKey: "Playback conversion failed"])
-        }
-        playerNode.scheduleBuffer(outputBuffer, completionHandler: nil)
-        if !playerNode.isPlaying {
-            playerNode.play()
-            print("Started playback")
-        }
-    }
+   public func playAudioChunk(audioData: Data) throws {
+       guard audioEngine.isRunning else {
+           throw NSError(domain: "AudioManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "Engine not running"])
+       }
+
+       // Ensure converter targets the current player output format
+       let currentPlayerOut = playerNode.outputFormat(forBus: 0)
+       if playbackConverter == nil || playbackConverter?.outputFormat != currentPlayerOut {
+           playbackConverter = AVAudioConverter(from: webSocketFormat, to: currentPlayerOut)
+           self.audioFormat = currentPlayerOut
+       }
+       guard let converter = playbackConverter else {
+           throw NSError(domain: "AudioManager", code: -2, userInfo: [NSLocalizedDescriptionKey: "Playback converter unavailable"])
+       }
+
+       print("Received playback chunk, size: \(audioData.count) bytes")
+       let frameCount = AVAudioFrameCount(audioData.count / (MemoryLayout<Int16>.size * Int(webSocketFormat.channelCount)))
+       guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: webSocketFormat, frameCapacity: frameCount) else {
+           throw NSError(domain: "AudioManager", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to create input buffer"])
+       }
+       inputBuffer.frameLength = frameCount
+       audioData.withUnsafeBytes { raw in
+           inputBuffer.int16ChannelData?.pointee.update(
+               from: raw.baseAddress!.assumingMemoryBound(to: Int16.self),
+               count: Int(frameCount * webSocketFormat.channelCount)
+           )
+       }
+
+       let outFrames = UInt32(round(Double(frameCount) * currentPlayerOut.sampleRate / webSocketFormat.sampleRate))
+       guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: currentPlayerOut, frameCapacity: AVAudioFrameCount(outFrames)) else {
+           throw NSError(domain: "AudioManager", code: -4, userInfo: [NSLocalizedDescriptionKey: "Failed to create output buffer"])
+       }
+
+       var convErr: NSError?
+       let status = converter.convert(to: outputBuffer, error: &convErr) { _, outStatus in
+           outStatus.pointee = .haveData
+           return inputBuffer
+       }
+       if let e = convErr { throw e }
+       if status == .error || outputBuffer.frameLength == 0 {
+           throw NSError(domain: "AudioManager", code: -5, userInfo: [NSLocalizedDescriptionKey: "Playback conversion failed"])
+       }
+
+       playerNode.scheduleBuffer(outputBuffer, completionHandler: nil)
+       if !playerNode.isPlaying {
+           playerNode.play()
+           print("Started playback")
+       }
+   }
 
     public func stopPlayback() {
         playerNode.stop()
@@ -425,9 +438,9 @@ public class AudioManager {
             print("Engine stopped, attempting to restart")
             do {
                 try audioEngine.start()
-                //  Refresh formats; converters may be invalid after a route change
+
                 self.inputFormat = inputNode.outputFormat(forBus: 0)
-                self.audioFormat = audioEngine.mainMixerNode.outputFormat(forBus: 0)
+                self.audioFormat = playerNode.outputFormat(forBus: 0)   // ✅ match player
                 setupConverters()
 
                 if isRecording {
