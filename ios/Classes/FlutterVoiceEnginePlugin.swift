@@ -146,23 +146,27 @@ public class FlutterVoiceEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
     }
 
     private func initialize(audioConfig: [String: Any], sessionConfig: [String: Any], processors: [[String: Any]], result: @escaping FlutterResult) {
+        // Simple re-initialization handling
         if isInitialized {
-            print("AudioManager already initialized. Skipping re-init.")
-            result(nil)
-            return
+            print("AudioManager already initialized. Shutting down first...")
+            audioManager.shutdownAll()
+            cancellables.removeAll()
+            isInitialized = false
         }
-
+        
         let channels = audioConfig["channels"] as? UInt32 ?? 1
         let sampleRate = audioConfig["sampleRate"] as? Double ?? 48000.0
         let bitDepth = audioConfig["bitDepth"] as? Int ?? 16
         let bufferSize = audioConfig["bufferSize"] as? Int ?? 4096
         let amplitudeThreshold = audioConfig["amplitudeThreshold"] as? Float ?? 0.05
         let enableAEC = audioConfig["enableAEC"] as? Bool ?? true
+        
         let category = mapCategory(sessionConfig["category"] as? String ?? "playAndRecord")
         let mode = mapMode(sessionConfig["mode"] as? String ?? "spokenAudio")
         let options = (sessionConfig["options"] as? [String] ?? []).compactMap { mapOption($0) }
         let preferredBufferDuration = sessionConfig["preferredBufferDuration"] as? Double ?? 0.005
-
+        
+        // Create AudioManager but DON'T configure audio session yet
         audioManager = AudioManager(
             channels: channels,
             sampleRate: sampleRate,
@@ -176,10 +180,14 @@ public class FlutterVoiceEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
             preferredSampleRate: sampleRate,
             preferredBufferDuration: preferredBufferDuration
         )
+        
         audioManager.eventSink = eventSink
+        
+        // Setup engine immediately (no delay needed)
         audioManager.setupEngine()
         isInitialized = true
-        print("Plugin: Initialization complete")
+        
+        print("✅ Plugin: Initialization complete")
         result(nil)
     }
 
@@ -237,7 +245,15 @@ public class FlutterVoiceEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
         print("Plugin: Setting up event stream")
         eventSink = events
         audioManager.eventSink = events
-
+        audioManager.startRecording().sink { [weak self] audioData in
+            DispatchQueue.main.async {
+                guard let sink = self?.eventSink else {
+                    print("Plugin: eventSink is nil, cannot send audio chunk")
+                    return
+                }
+                sink(["type": "audio_chunk", "data": FlutterStandardTypedData(bytes: audioData)])
+            }
+        }.store(in: &cancellables)
         audioManager.startEmittingMusicPosition()
         DispatchQueue.main.async {
             print("Plugin: Sending initial music state: \(self.audioManager.musicIsPlaying)")
@@ -245,7 +261,6 @@ public class FlutterVoiceEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
         }
         return nil
     }
-
 
     public func onCancel(withArguments arguments: Any?) -> FlutterError? {
         print("Plugin: Cancelling event stream")

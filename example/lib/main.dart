@@ -55,7 +55,7 @@ class _HomePageState extends State<HomePage> {
                   ),
                 const SizedBox(height: 20),
                 ElevatedButton(
-                  onPressed: state.isSessionStarted ? null : () => context.read<SessionCubit>().startSession(),
+                  onPressed: state.isSessionStarted ? null : () => context.read<SessionCubit>().startSession({}),
                   child: const Text('Start Session'),
                 ),
                 ElevatedButton(

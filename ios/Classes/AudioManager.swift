@@ -8,9 +8,9 @@ public class AudioManager {
     private let audioEngine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
     private var inputNode: AVAudioInputNode { audioEngine.inputNode }
-    private var inputFormat: AVAudioFormat
-    private var audioFormat: AVAudioFormat
-    private var webSocketFormat: AVAudioFormat
+    private var inputFormat: AVAudioFormat!
+    private var audioFormat: AVAudioFormat!
+    private var webSocketFormat: AVAudioFormat!
     private var isRecording = false
     private let audioChunkPublisher = PassthroughSubject<Data, Never>()
     public let errorPublisher = PassthroughSubject<String, Never>()
@@ -22,14 +22,15 @@ public class AudioManager {
     private let targetSampleRate: Float64 = 24000
     
     // Background Music Related
-    
     private var queuePlayer: AVQueuePlayer = AVQueuePlayer()
     private var playerLooper: AVPlayerLooper?
     private var playlistItems: [AVPlayerItem] = []
     private var musicPositionTimer: Timer?
     public var musicIsPlaying = false
-    
     public var eventSink: FlutterEventSink?
+    
+    // CRITICAL FIX: Track engine setup state
+    private var isEngineSetup = false
     
     public init(
         channels: UInt32 = 1,
@@ -46,179 +47,364 @@ public class AudioManager {
     ) {
         self.amplitudeThreshold = amplitudeThreshold
         self.enableAEC = enableAEC
-
-        let session = AVAudioSession.sharedInstance()
-        do {
-            // Prefer HFP when AEC is on; avoid A2DP
-            var sessionOptions = options
-            if enableAEC {
-                sessionOptions.remove(.allowBluetoothA2DP)
-                sessionOptions.insert(.allowBluetooth)
-            }
-
-            try session.setCategory(category, mode: mode, options: sessionOptions)
-            try session.setPreferredSampleRate(preferredSampleRate)
-            try session.setPreferredIOBufferDuration(preferredBufferDuration)
-            if session.isInputGainSettable {
-                try session.setInputGain(1.0)
-            }
-            try session.setActive(true, options: [.notifyOthersOnDeactivation])
-            print("Audio session configured: sr=\(session.sampleRate), outCh=\(session.outputNumberOfChannels), ioBuffer=\(session.ioBufferDuration), opts=\(session.categoryOptions.rawValue)")
-        } catch {
-            print("Failed to configure audio session: \(error)")
-            errorPublisher.send("Audio session error: \(error.localizedDescription)")
-        }
-
-        // ---- Initialize required stored formats with safe placeholders ----
-        let sr = session.sampleRate > 0 ? session.sampleRate : sampleRate
-
-        // Input: float32, interleaved, channel count from param
-        self.inputFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sr,
-            channels: AVAudioChannelCount(channels),
-            interleaved: true
-        )!
-
-        // Mixer/output working format placeholder: float32, non-interleaved, 2ch
-        self.audioFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sr,
-            channels: 2,
-            interleaved: false
-        )!
-
-        // Uplink/websocket format: int16 @ target sample rate, channels from param
-        self.webSocketFormat = AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: targetSampleRate,
-            channels: AVAudioChannelCount(channels),
-            interleaved: true
-        )!
-
-        // Converters will be built after engine starts (in setupEngine)
-        self.recordingConverter = nil
-        self.playbackConverter  = nil
-
-        // setupEngine() will:
-        // - start the engine + enable voice processing
-        // - refresh inputFormat/audioFormat from actual hardware
-        // - rebuild converters via setupConverters()
+        
+        // CRITICAL FIX: Don't configure audio session in init - do it in setupEngine
+        // Just store the parameters for later use
+        print("AudioManager init completed - formats will be created in setupEngine")
     }
-
-
-    private func setupConverters() {
-        recordingConverter = AVAudioConverter(from: inputFormat, to: webSocketFormat)
-        playbackConverter = AVAudioConverter(from: webSocketFormat, to: audioFormat)
-        if recordingConverter == nil || playbackConverter == nil {
-            errorPublisher.send("Failed to initialize audio converters")
-            DispatchQueue.main.async { [weak self] in
-                self?.eventSink?(["type": "error", "message": "Failed to initialize audio converters"])
-            }
-        } else {
-            print("Converters initialized: recording=\(inputFormat)->\(webSocketFormat), playback=\(webSocketFormat)->\(audioFormat)")
-        }
-    }
-
+    
     public func setupEngine() {
-        let session = AVAudioSession.sharedInstance()
+        print("Setting up audio engine...")
+        
+        // CRITICAL FIX: Only configure audio session here, once
+        configureAudioSession()
+        
+        // CRITICAL FIX: Only disconnect if engine was previously setup
+        if isEngineSetup {
+            if audioEngine.attachedNodes.contains(playerNode) {
+                audioEngine.disconnectNodeOutput(playerNode)
+                audioEngine.detach(playerNode)
+            }
+        }
+        
+        // Reset engine if running
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
+        
+        guard let audioFormat = audioFormat else {
+            print("❌ Cannot setup engine: audioFormat not initialized")
+            return
+        }
+        
+        // Attach and connect nodes
         audioEngine.attach(playerNode)
-        audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: nil)
+        audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: audioFormat)
+        audioEngine.connect(audioEngine.mainMixerNode, to: audioEngine.outputNode, format: nil) // Use default format
         audioEngine.mainMixerNode.outputVolume = 1.0
-
+        
+        // Start engine and enable AEC
         do {
-            try session.setActive(true)
             if enableAEC {
                 try inputNode.setVoiceProcessingEnabled(true)
-                print("Voice processing enabled for AEC")
+                print("✅ Voice processing (AEC) enabled")
             }
+            
             try audioEngine.start()
-            print("Audio engine started")
-
-            // Refresh formats AFTER engine + voice processing are active
-            self.inputFormat = inputNode.outputFormat(forBus: 0)
-
-            // ✅ Use the ACTUAL player node output format to avoid channel mismatches
-            let playerOutFormat = playerNode.outputFormat(forBus: 0)
-            self.audioFormat = playerOutFormat
-
-            // Uplink stays 16-bit mono@24k (or channels matching input if you kept that)
+            isEngineSetup = true
+            print("✅ Audio engine started successfully")
+            
+        } catch {
+            print("❌ Failed to start audio engine: \(error)")
+            errorPublisher.send("Engine start error: \(error.localizedDescription)")
+            DispatchQueue.main.async { [weak self] in
+                self?.eventSink?(["type": "error", "message": "Engine start error: \(error.localizedDescription)"])
+            }
+        }
+    }
+    
+    // CRITICAL FIX: Simplified audio session configuration
+    private func configureAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        
+        do {
+            // Set category first
+            try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.defaultToSpeaker, .mixWithOthers, .allowBluetoothA2DP])
+            print("✅ Audio category set successfully")
+            
+            // Set preferred settings
+            try session.setPreferredSampleRate(48000.0)
+            try session.setPreferredIOBufferDuration(0.005)
+            
+            // Activate session
+            try session.setActive(true, options: [.notifyOthersOnDeactivation])
+            print("✅ Audio session activated")
+            
+            // Get actual hardware capabilities
+            let actualSampleRate = session.sampleRate
+            let actualInputChannels = session.inputNumberOfChannels
+            
+            print("📊 Actual audio session: sampleRate=\(actualSampleRate), inputCh=\(actualInputChannels)")
+            
+            // CRITICAL FIX: Create formats based on actual hardware
+            guard actualInputChannels > 0 else {
+                throw NSError(domain: "AudioManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "No input channels available"])
+            }
+            
+            // Use actual sample rate from hardware
+            self.inputFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: actualSampleRate,
+                channels: 1,
+                interleaved: true
+            )
+            
+            self.audioFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: actualSampleRate,
+                channels: 2,
+                interleaved: false
+            )
+            
             self.webSocketFormat = AVAudioFormat(
                 commonFormat: .pcmFormatInt16,
                 sampleRate: targetSampleRate,
-                channels: inputFormat.channelCount,
+                channels: 1,
                 interleaved: true
-            )!
-
-            // Rebuild converters with the exact formats
-            setupConverters()                 // recordingConverter: input -> ws, playbackConverter: ws -> audioFormat
-            print("Formats: input=\(inputFormat), playerOut=\(playerOutFormat), ws=\(webSocketFormat)")
+            )
+            
+            // Validate formats
+            guard let inputFormat = self.inputFormat,
+                  let audioFormat = self.audioFormat,
+                  let webSocketFormat = self.webSocketFormat else {
+                throw NSError(domain: "AudioManager", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to create valid audio formats"])
+            }
+            
+            print("✅ Audio formats created successfully")
+            print("   Input: \(inputFormat)")
+            print("   Output: \(audioFormat)")
+            print("   WebSocket: \(webSocketFormat)")
+            
+            // Setup converters
+            setupConverters()
+            
         } catch {
-            print("Failed to start audio engine or enable AEC: \(error)")
-            errorPublisher.send("Engine error: \(error.localizedDescription)")
+            print("❌ Failed to configure audio session: \(error)")
+            errorPublisher.send("Audio session error: \(error.localizedDescription)")
             DispatchQueue.main.async { [weak self] in
-                self?.eventSink?(["type": "error", "message": "Engine error: \(error.localizedDescription)"])
+                self?.eventSink?(["type": "error", "message": "Audio session error: \(error.localizedDescription)"])
             }
         }
     }
-
-    public func emitMusicIsPlaying() {
-        DispatchQueue.main.async { [weak self] in
-            guard let sink = self?.eventSink else {
-                print("eventSink is nil, cannot send music state")
+    
+    private func setupConverters() {
+        guard let inputFormat = inputFormat,
+              let audioFormat = audioFormat,
+              let webSocketFormat = webSocketFormat else {
+            print("❌ Cannot setup converters: formats not initialized")
+            return
+        }
+        
+        recordingConverter = AVAudioConverter(from: inputFormat, to: webSocketFormat)
+        playbackConverter = AVAudioConverter(from: webSocketFormat, to: audioFormat)
+        
+        guard recordingConverter != nil, playbackConverter != nil else {
+            let error = "Failed to initialize audio converters"
+            print("❌ \(error)")
+            errorPublisher.send(error)
+            DispatchQueue.main.async { [weak self] in
+                self?.eventSink?(["type": "error", "message": error])
+            }
+            return
+        }
+        
+        print("✅ Converters initialized successfully")
+    }
+    
+    // CRITICAL FIX: Safer tap installation
+    private func installRecordingTap() {
+        let bus = 0
+        inputNode.removeTap(onBus: bus)
+        
+        guard let converter = recordingConverter else {
+            print("❌ Cannot install tap: missing converter")
+            return
+        }
+        
+        // Use input node's actual format
+        let tapFormat = inputNode.inputFormat(forBus: bus)
+        print("📊 Installing tap with format: \(tapFormat)")
+        
+        // CRITICAL FIX: If format changed, recreate converter
+        if tapFormat != inputFormat {
+            print("⚠️ Format mismatch, recreating converter")
+            recordingConverter = AVAudioConverter(from: tapFormat, to: webSocketFormat!)
+            guard recordingConverter != nil else {
+                print("❌ Failed to recreate recording converter")
                 return
             }
-            print("Emitting music state: \(self?.musicIsPlaying ?? false)")
+        }
+        
+        inputNode.installTap(onBus: bus, bufferSize: 4096, format: tapFormat) { [weak self] buffer, _ in
+            self?.processRecordingBuffer(buffer)
+        }
+        
+        print("✅ Recording tap installed successfully")
+    }
+    
+    private func processRecordingBuffer(_ buffer: AVAudioPCMBuffer) {
+        guard let converter = recordingConverter else { return }
+        
+        let frameCapacity = UInt32(round(Double(buffer.frameLength) * converter.outputFormat.sampleRate / buffer.format.sampleRate))
+        
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: frameCapacity) else {
+            return
+        }
+        
+        var error: NSError?
+        let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
+            outStatus.pointee = .haveData
+            return buffer
+        }
+        
+        guard error == nil, status != .error, let data = outputBuffer.int16ChannelData?.pointee else {
+            return
+        }
+        
+        let byteCount = Int(outputBuffer.frameLength) * MemoryLayout<Int16>.size * Int(outputBuffer.format.channelCount)
+        let audioData = Data(bytes: data, count: byteCount)
+        audioChunkPublisher.send(audioData)
+    }
+    
+    public func startRecording() -> AnyPublisher<Data, Never> {
+        guard !isRecording else {
+            print("Already recording")
+            return audioChunkPublisher.eraseToAnyPublisher()
+        }
+        
+        isRecording = true
+        print("Starting recording...")
+        installRecordingTap()
+        return audioChunkPublisher.eraseToAnyPublisher()
+    }
+    
+    public func stopRecording() {
+        guard isRecording else { return }
+        isRecording = false
+        inputNode.removeTap(onBus: 0)
+        print("Recording stopped")
+    }
+    
+    public func playAudioChunk(audioData: Data) throws {
+        guard audioEngine.isRunning, let converter = playbackConverter else {
+            throw NSError(domain: "AudioManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "Engine or converter unavailable"])
+        }
+        
+        let frameCount = AVAudioFrameCount(audioData.count / (MemoryLayout<Int16>.size * Int(webSocketFormat!.channelCount)))
+        
+        guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: webSocketFormat!, frameCapacity: frameCount) else {
+            throw NSError(domain: "AudioManager", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to create input buffer"])
+        }
+        
+        inputBuffer.frameLength = frameCount
+        audioData.withUnsafeBytes { rawBuffer in
+            inputBuffer.int16ChannelData?.pointee.update(
+                from: rawBuffer.baseAddress!.assumingMemoryBound(to: Int16.self),
+                count: Int(frameCount * webSocketFormat!.channelCount)
+            )
+        }
+        
+        let outputFrameCapacity = UInt32(round(Double(frameCount) * audioFormat!.sampleRate / webSocketFormat!.sampleRate))
+        
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: audioFormat!, frameCapacity: outputFrameCapacity) else {
+            throw NSError(domain: "AudioManager", code: -4, userInfo: [NSLocalizedDescriptionKey: "Failed to create output buffer"])
+        }
+        
+        var error: NSError?
+        let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
+            outStatus.pointee = .haveData
+            return inputBuffer
+        }
+        
+        if let error = error { throw error }
+        if status == .error {
+            throw NSError(domain: "AudioManager", code: -5, userInfo: [NSLocalizedDescriptionKey: "Playback conversion failed"])
+        }
+        
+        playerNode.scheduleBuffer(outputBuffer, completionHandler: nil)
+        if !playerNode.isPlaying {
+            playerNode.play()
+        }
+    }
+    
+    public func stopPlayback() {
+        playerNode.stop()
+        playerNode.reset()
+        print("Playback stopped")
+    }
+    
+    public func shutdownBot() {
+        stopRecording()
+        stopPlayback()
+        print("Bot stopped, music continues if playing.")
+    }
+    
+    public func shutdownAll() {
+        stopRecording()
+        stopPlayback()
+        
+        // Stop music
+        queuePlayer.pause()
+        playerLooper?.disableLooping()
+        playlistItems.removeAll()
+        stopEmittingMusicPosition()
+        
+        // Stop engine
+        if isEngineSetup {
+            audioEngine.stop()
+            isEngineSetup = false
+        }
+        cancellables.removeAll()
+        
+        // Deactivate session
+        do {
+            try AVAudioSession.sharedInstance().setActive(false)
+        } catch {
+            print("Failed to deactivate audio session: \(error)")
+        }
+        
+        print("AudioManager shutdown complete")
+    }
+    
+    // CRITICAL FIX: Simpler configuration change handling
+    public func handleConfigurationChange() {
+        print("⚠️ Audio engine configuration changed")
+        
+        if !audioEngine.isRunning && isEngineSetup {
+            print("Engine stopped, restarting...")
+            setupEngine()
+        }
+    }
+    
+    // Music methods remain the same...
+    public func emitMusicIsPlaying() {
+        DispatchQueue.main.async { [weak self] in
+            guard let sink = self?.eventSink else { return }
             sink(["type": "music_state", "state": self?.musicIsPlaying ?? false])
         }
     }
-
+    
     public func setBackgroundMusicVolume(_ volume: Float) {
         queuePlayer.volume = volume
     }
-
+    
     public func getBackgroundMusicVolume() -> Float {
         return queuePlayer.volume
     }
-
     
     public func startEmittingMusicPosition() {
-      stopEmittingMusicPosition()
-
-      musicPositionTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
-        guard let self = self,
-              let currentItem = self.queuePlayer.currentItem,
-              currentItem.status == .readyToPlay
-        else { return }
-
-        let rawPos  = CMTimeGetSeconds(self.queuePlayer.currentTime())
-        let duration = CMTimeGetSeconds(currentItem.duration)
-        // clamp between 0 and duration:
-        let position = max(0, min(rawPos, duration))
-
-        DispatchQueue.main.async {
-          self.eventSink?([
-            "type":     "music_position",
-            "position": position,
-            "duration": duration
-          ])
+        stopEmittingMusicPosition()
+        musicPositionTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            guard let self = self, let currentItem = self.queuePlayer.currentItem, currentItem.status == .readyToPlay else { return }
+            let rawPos = CMTimeGetSeconds(self.queuePlayer.currentTime())
+            let duration = CMTimeGetSeconds(currentItem.duration)
+            let position = max(0, min(rawPos, duration))
+            DispatchQueue.main.async {
+                self.eventSink?(["type": "music_position", "position": position, "duration": duration])
+            }
         }
-      }
-
-      RunLoop.main.add(musicPositionTimer!, forMode: .common)
+        RunLoop.main.add(musicPositionTimer!, forMode: .common)
     }
-
-
+    
     public func stopEmittingMusicPosition() {
-        print("Stopping music position timer")
         musicPositionTimer?.invalidate()
         musicPositionTimer = nil
     }
-
+    
     private func isRemoteURL(_ source: String) -> Bool {
         return source.lowercased().hasPrefix("http://") || source.lowercased().hasPrefix("https://")
     }
-
+    
     private func downloadToTemp(_ urlStr: String, completion: @escaping (String?) -> Void) {
         guard let url = URL(string: urlStr) else { completion(nil); return }
         let tempDir = FileManager.default.temporaryDirectory
@@ -228,254 +414,34 @@ public class AudioManager {
             completion(localPath)
             return
         }
+        
         let task = URLSession.shared.downloadTask(with: url) { (tempURL, _, error) in
             if let tempURL = tempURL, error == nil {
                 do {
                     try FileManager.default.moveItem(at: tempURL, to: URL(fileURLWithPath: localPath))
                     completion(localPath)
-                    print("Downloaded track: \(urlStr) to \(localPath)")
                 } catch {
                     print("Failed to move downloaded file: \(error)")
                     completion(nil)
                 }
             } else {
                 print("Failed to download music from \(urlStr): \(error?.localizedDescription ?? "Unknown error")")
-                DispatchQueue.main.async { [weak self] in
-                    self?.eventSink?(["type": "error", "message": "Failed to download music from \(urlStr)"])
-                }
                 completion(nil)
             }
         }
         task.resume()
     }
-
+    
     private func md5(_ string: String) -> String {
         let data = Data(string.utf8)
         var digest = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))
-        data.withUnsafeBytes {
-            _ = CC_MD5($0.baseAddress, CC_LONG(data.count), &digest)
-        }
+        data.withUnsafeBytes { _ = CC_MD5($0.baseAddress, CC_LONG(data.count), &digest) }
         return digest.map { String(format: "%02hhx", $0) }.joined()
     }
-
-    private func installRecordingTap() {
-        let bus = 0
-        inputNode.removeTap(onBus: bus)
-
-        // Use nil so the tap uses the node’s native (hardware) format
-        inputNode.installTap(onBus: bus, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
-            guard let self = self else { return }
-
-            // Rebuild converter if route/format changed
-            if self.recordingConverter == nil || self.recordingConverter?.inputFormat != buffer.format {
-                self.recordingConverter = AVAudioConverter(from: buffer.format, to: self.webSocketFormat)
-                if self.recordingConverter == nil {
-                    self.errorPublisher.send("Failed to init recording converter")
-                    DispatchQueue.main.async { self.eventSink?(["type":"error","message":"Failed to init recording converter"]) }
-                    return
-                }
-            }
-
-            guard let converter = self.recordingConverter else { return }
-
-            let frameCapacity = UInt32(round(Double(buffer.frameLength) * converter.outputFormat.sampleRate / buffer.format.sampleRate))
-            guard let out = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: frameCapacity) else {
-                DispatchQueue.main.async { self.eventSink?(["type":"error","message":"Failed to create output buffer"]) }
-                return
-            }
-
-            var convErr: NSError?
-            let status = converter.convert(to: out, error: &convErr) { _, outStatus in
-                outStatus.pointee = .haveData
-                return buffer
-            }
-            if let error = convErr {
-                self.errorPublisher.send("Recording conversion error: \(error.localizedDescription)")
-                DispatchQueue.main.async {
-                    self.eventSink?(["type": "error", "message": "Recording conversion error: \(error.localizedDescription)"])
-                }
-                return
-            }
-            if status == .error {
-                self.errorPublisher.send("Recording conversion failed")
-                DispatchQueue.main.async {
-                    self.eventSink?(["type": "error", "message": "Recording conversion failed"])
-                }
-                return
-            }
-            
-            guard out.frameLength > 0 else { return }
-
-            if let ptr = out.int16ChannelData?.pointee {
-                let bytes = Int(out.frameLength) * MemoryLayout<Int16>.size * Int(out.format.channelCount)
-                self.audioChunkPublisher.send(Data(bytes: ptr, count: bytes))
-            } else {
-                DispatchQueue.main.async { self.eventSink?(["type":"error","message":"No audio data in output buffer"]) }
-            }
-        }
-    }
-
-
-    public func startRecording() -> AnyPublisher<Data, Never> {
-        guard !isRecording else { return audioChunkPublisher.eraseToAnyPublisher() }
-        isRecording = true
-
-        // ✅ Defensive: ensure engine is running before installing the tap
-        if !audioEngine.isRunning {
-            do { try audioEngine.start() } catch {
-                errorPublisher.send("Engine start failed: \(error.localizedDescription)")
-                DispatchQueue.main.async { [weak self] in
-                    self?.eventSink?(["type":"error","message":"Engine start failed: \(error.localizedDescription)"])
-                }
-                return audioChunkPublisher.eraseToAnyPublisher()
-            }
-        }
-
-        print("Starting recording with wsFormat=\(webSocketFormat)")
-        installRecordingTap()
-        return audioChunkPublisher.eraseToAnyPublisher()
-    }
-
-
-    public func stopRecording() {
-        guard isRecording else { return }
-        isRecording = false
-        inputNode.removeTap(onBus: 0)
-        print("Recording stopped")
-    }
-
-   public func playAudioChunk(audioData: Data) throws {
-       guard audioEngine.isRunning else {
-           throw NSError(domain: "AudioManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "Engine not running"])
-       }
-
-       // Ensure converter targets the current player output format
-       let currentPlayerOut = playerNode.outputFormat(forBus: 0)
-       if playbackConverter == nil || playbackConverter?.outputFormat != currentPlayerOut {
-           playbackConverter = AVAudioConverter(from: webSocketFormat, to: currentPlayerOut)
-           self.audioFormat = currentPlayerOut
-       }
-       guard let converter = playbackConverter else {
-           throw NSError(domain: "AudioManager", code: -2, userInfo: [NSLocalizedDescriptionKey: "Playback converter unavailable"])
-       }
-
-       print("Received playback chunk, size: \(audioData.count) bytes")
-       let frameCount = AVAudioFrameCount(audioData.count / (MemoryLayout<Int16>.size * Int(webSocketFormat.channelCount)))
-       guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: webSocketFormat, frameCapacity: frameCount) else {
-           throw NSError(domain: "AudioManager", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to create input buffer"])
-       }
-       inputBuffer.frameLength = frameCount
-       audioData.withUnsafeBytes { raw in
-           inputBuffer.int16ChannelData?.pointee.update(
-               from: raw.baseAddress!.assumingMemoryBound(to: Int16.self),
-               count: Int(frameCount * webSocketFormat.channelCount)
-           )
-       }
-
-       let outFrames = UInt32(round(Double(frameCount) * currentPlayerOut.sampleRate / webSocketFormat.sampleRate))
-       guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: currentPlayerOut, frameCapacity: AVAudioFrameCount(outFrames)) else {
-           throw NSError(domain: "AudioManager", code: -4, userInfo: [NSLocalizedDescriptionKey: "Failed to create output buffer"])
-       }
-
-       var convErr: NSError?
-       let status = converter.convert(to: outputBuffer, error: &convErr) { _, outStatus in
-           outStatus.pointee = .haveData
-           return inputBuffer
-       }
-       if let e = convErr { throw e }
-       if status == .error || outputBuffer.frameLength == 0 {
-           throw NSError(domain: "AudioManager", code: -5, userInfo: [NSLocalizedDescriptionKey: "Playback conversion failed"])
-       }
-
-       playerNode.scheduleBuffer(outputBuffer, completionHandler: nil)
-       if !playerNode.isPlaying {
-           playerNode.play()
-           print("Started playback")
-       }
-   }
-
-    public func stopPlayback() {
-        playerNode.stop()
-        playerNode.reset()
-        print("Playback stopped")
-    }
-
     
-
-    public func shutdownBot() {
-        stopRecording()
-        stopPlayback()
-        print("Bot stopped, music continues if playing.")
-    }
-
-    public func shutdownAll() {
-        stopRecording()
-        stopPlayback()
-
-        // stop and clear background music
-        queuePlayer.pause()
-        playerLooper?.disableLooping()
-        playlistItems.removeAll()
-        stopEmittingMusicPosition()
-
-        // tear down audio engine
-        audioEngine.stop()
-        cancellables.removeAll()
-        do {
-            try AVAudioSession.sharedInstance().setActive(false)
-        } catch {
-            print("Failed to deactivate audio session: \(error)")
-            DispatchQueue.main.async { [weak self] in
-                self?.eventSink?(["type": "error", "message": "Failed to deactivate audio session: \(error.localizedDescription)"])
-            }
-        }
-        print("AudioManager shutdown (bot + music)")
-    }
-
-    public func handleConfigurationChange() {
-        print("Audio engine configuration changed")
-        if !audioEngine.isRunning {
-            print("Engine stopped, attempting to restart")
-            do {
-                try audioEngine.start()
-
-                self.inputFormat = inputNode.outputFormat(forBus: 0)
-                self.audioFormat = playerNode.outputFormat(forBus: 0)   // ✅ match player
-                setupConverters()
-
-                if isRecording {
-                    print("Reinstalling recording tap")
-                    installRecordingTap()
-                }
-            } catch {
-                print("Failed to restart audio engine: \(error)")
-                errorPublisher.send("Engine restart failed: \(error.localizedDescription)")
-                DispatchQueue.main.async { [weak self] in
-                    self?.eventSink?(["type": "error", "message": "Engine restart failed: \(error.localizedDescription)"])
-                }
-            }
-        }
-    }
-
-
-    public func isRecordingActive() -> Bool {
-        return isRecording
-    }
-
-    
-    
-    
-    
-    // ----------------- Background Music Work ---------------------
-    
-    /// Replace your existing `setMusicPlaylist(_:)` with this:
-    // 1) setMusicPlaylist: just builds your array of AVPlayerItems (remote or local). We no longer enqueue them here.
     public func setMusicPlaylist(_ urls: [String]) {
-        // 1) Tear down any existing queue/looper
         playerLooper?.disableLooping()
         queuePlayer.removeAllItems()
-        
-        // 2) Build AVPlayerItems from AVURLAssets, kick off an async preload of the 'playable' & 'duration' keys
         playlistItems = urls.compactMap { urlStr in
             let assetURL: URL
             if isRemoteURL(urlStr), let u = URL(string: urlStr) {
@@ -483,84 +449,66 @@ public class AudioManager {
             } else {
                 assetURL = URL(fileURLWithPath: urlStr)
             }
-            
             let asset = AVURLAsset(url: assetURL)
-            // prime the asset so metadata & first frames are ready
-            asset.loadValuesAsynchronously(forKeys: ["playable", "duration"]) {
-                // you could inspect statusOfValue here if you need to error-handle
-            }
-            
+            asset.loadValuesAsynchronously(forKeys: ["playable", "duration"]) { }
             let item = AVPlayerItem(asset: asset)
-            // buffer at least a few seconds before playback
             item.preferredForwardBufferDuration = 5.0
             return item
         }
     }
-
-
-
     
-    /// Play a single file, optionally looping
     public func playBackgroundMusic(source: String, loop: Bool = true) {
-        // Create the item
         let url = URL(fileURLWithPath: source)
         let item = AVPlayerItem(url: url)
         queuePlayer.removeAllItems()
         queuePlayer.insert(item, after: nil)
-
         if loop {
-          // Attach an AVPlayerLooper to keep it seamlessly looping
-          playerLooper = AVPlayerLooper(player: queuePlayer, templateItem: item)
+            playerLooper = AVPlayerLooper(player: queuePlayer, templateItem: item)
         } else {
-          playerLooper?.disableLooping()
+            playerLooper?.disableLooping()
         }
-
         queuePlayer.play()
         musicIsPlaying = true
         emitMusicIsPlaying()
         startEmittingMusicPosition()
     }
     
-    /// Replace your existing `playTrackAtIndex(_:)` with this:
     public func playTrackAtIndex(_ index: Int) {
         guard index >= 0 && index < playlistItems.count else {
             eventSink?(["type":"error","message":"Invalid track index"])
             return
         }
-
         playerLooper?.disableLooping()
         queuePlayer.pause()
         queuePlayer.removeAllItems()
-
         let template = playlistItems[index]
         queuePlayer.insert(template, after: nil)
         playerLooper = AVPlayerLooper(player: queuePlayer, templateItem: template)
-
         queuePlayer.play()
         musicIsPlaying = true
         emitMusicIsPlaying()
         startEmittingMusicPosition()
     }
-
     
     public func stopBackgroundMusic() {
         queuePlayer.pause()
         musicIsPlaying = false
         stopEmittingMusicPosition()
-        emitMusicIsPlaying()         // → sends {"type":"music_state","state": false}
+        emitMusicIsPlaying()
         playerLooper?.disableLooping()
     }
     
-    // 3) seekBackgroundMusic: seeks the queuePlayer and resumes if needed
     public func seekBackgroundMusic(to position: Double) {
         let cm = CMTime(seconds: position, preferredTimescale: 1_000)
         queuePlayer.seek(to: cm) { [weak self] _ in
             guard let self = self else { return }
-            // resume only if it was already playing
             if self.musicIsPlaying {
                 self.queuePlayer.play()
             }
         }
     }
-
+    
+    public func isRecordingActive() -> Bool {
+        return isRecording
+    }
 }
