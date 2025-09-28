@@ -95,9 +95,33 @@ class AudioManager(
             AudioTrack.MODE_STREAM,
             audioRecord!!.audioSessionId // ✅ the same sessionId
         )
+
         val audioService = context.getSystemService(Context.AUDIO_SERVICE) as AndroidAudioManager
-        audioService.mode = AndroidAudioManager.MODE_IN_COMMUNICATION
-        audioService.isSpeakerphoneOn = true
+
+        // 👇 Detect headset (wired or bluetooth)
+        val hasHeadset =
+            audioService.isWiredHeadsetOn ||
+            audioService.isBluetoothScoOn ||
+            audioService.isBluetoothA2dpOn
+
+        if (hasHeadset) {
+            // 🎧 في سماعة → خليه يخرج الصوت من السماعة
+            audioService.mode = AndroidAudioManager.MODE_IN_COMMUNICATION
+            audioService.isSpeakerphoneOn = false
+            if (audioService.isBluetoothScoAvailableOffCall) {
+                audioService.startBluetoothSco()
+                audioService.isBluetoothScoOn = true
+            }
+            Log.d("AudioManager", "Headset detected, routing audio to headset")
+        } else {
+            // 📱 مفيش سماعة → خليه يخرج من الموبايل ويكون عالي
+            audioService.mode = AndroidAudioManager.MODE_NORMAL
+            audioService.isSpeakerphoneOn = true
+            val maxVolume = audioService.getStreamMaxVolume(AndroidAudioManager.STREAM_MUSIC)
+            audioService.setStreamVolume(AndroidAudioManager.STREAM_MUSIC, maxVolume, 0)
+            Log.d("AudioManager", "No headset, routing audio to speaker with max volume")
+        }
+
         if (audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
             errorChannel.trySend("AudioTrack initialization failed")
             Log.e("AudioManager", "AudioTrack initialization failed")
