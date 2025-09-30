@@ -161,6 +161,20 @@ public class FlutterVoiceEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
         let category = mapCategory(sessionConfig["category"] as? String ?? "playAndRecord")
         let mode = mapMode(sessionConfig["mode"] as? String ?? "spokenAudio")
         let options = (sessionConfig["options"] as? [String] ?? []).compactMap { mapOption($0) }
+        
+        // ✅ تعديل هنا
+        var finalOptions = AVAudioSession.CategoryOptions(options)
+        let session = AVAudioSession.sharedInstance()
+        let hasHeadphones = session.currentRoute.outputs.contains { output in
+            return output.portType == .headphones ||
+                   output.portType == .bluetoothA2DP ||
+                   output.portType == .bluetoothLE ||
+                   output.portType == .bluetoothHFP
+        }
+        if !hasHeadphones {
+            finalOptions.insert(.defaultToSpeaker) // يخلي الصوت عالي من Speaker لو مفيش سماعة
+        }
+
         let preferredBufferDuration = sessionConfig["preferredBufferDuration"] as? Double ?? 0.005
 
         audioManager = AudioManager(
@@ -172,7 +186,7 @@ public class FlutterVoiceEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
             enableAEC: enableAEC,
             category: category,
             mode: mode,
-            options: AVAudioSession.CategoryOptions(options),
+            options: finalOptions,
             preferredSampleRate: sampleRate,
             preferredBufferDuration: preferredBufferDuration
         )

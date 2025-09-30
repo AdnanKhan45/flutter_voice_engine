@@ -76,7 +76,11 @@ class FlutterVoiceEnginePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         scope.cancel()
         result.success(null)
       }
-
+      "hasWiredOrBluetoothHeadset" -> {
+          val audioSys = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+          val hasHeadset = audioSys.isWiredHeadsetOn || audioSys.isBluetoothScoOn || audioSys.isBluetoothA2dpOn
+          result.success(hasHeadset)
+        }
       else -> result.notImplemented()
     }
   }
