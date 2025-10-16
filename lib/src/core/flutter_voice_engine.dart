@@ -195,4 +195,11 @@ class FlutterVoiceEngine {
     await _musicStateController.close();
     await _errorController.close();
   }
+
+  Future<void> stop() async {
+    if (!isInitialized) return;
+    await _channel.invokeMethod('stop');
+    isInitialized = false;
+    isRecording = false;
+  }
 }

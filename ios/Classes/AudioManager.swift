@@ -356,6 +356,28 @@ public class AudioManager {
         print("AudioManager shutdown complete")
     }
     
+    // New: stop bot and engine, keep music unchanged
+    public func stop() {
+        // Stop bot activities
+        stopRecording()
+        stopPlayback()
+        
+        // Stop engine if running
+        if isEngineSetup {
+            audioEngine.stop()
+            isEngineSetup = false
+        }
+        
+        // Deactivate audio session (does not touch music players; they use AVPlayer)
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+        } catch {
+            print("Failed to deactivate audio session in stop(): \(error)")
+        }
+        
+        print("Stop completed (bot + engine stopped, music untouched)")
+    }
+    
     // CRITICAL FIX: Simpler configuration change handling
     public func handleConfigurationChange() {
         print("⚠️ Audio engine configuration changed")
