@@ -102,8 +102,7 @@ public class AudioManager {
             }
         }
     }
-    
-    // CRITICAL FIX: Simplified audio session configuration
+
     private func configureAudioSession() {
         let session = AVAudioSession.sharedInstance()
         
@@ -120,45 +119,79 @@ public class AudioManager {
             try session.setActive(true, options: [.notifyOthersOnDeactivation])
             print("✅ Audio session activated")
             
-            // Get actual hardware capabilities
-            let actualSampleRate = session.sampleRate
-            let actualInputChannels = session.inputNumberOfChannels
+            // CRITICAL FIX: Wait for hardware to stabilize and validate
+            var retries = 0
+            var actualSampleRate: Double = 0
+            var actualInputChannels: Int = 0
+            
+            repeat {
+                actualSampleRate = session.sampleRate
+                actualInputChannels = session.inputNumberOfChannels
+                
+                if actualSampleRate > 0 && actualInputChannels > 0 {
+                    break
+                }
+                
+                print("⚠️ Waiting for audio hardware to stabilize (attempt \(retries + 1))...")
+                Thread.sleep(forTimeInterval: 0.05) // 50ms delay
+                retries += 1
+            } while retries < 5
+            
+            // Validate hardware values before creating formats
+            guard actualSampleRate > 0 && actualInputChannels > 0 else {
+                throw NSError(
+                    domain: "AudioManager",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Invalid audio hardware state: sampleRate=\(actualSampleRate), inputChannels=\(actualInputChannels)"]
+                )
+            }
             
             print("📊 Actual audio session: sampleRate=\(actualSampleRate), inputCh=\(actualInputChannels)")
             
-            // CRITICAL FIX: Create formats based on actual hardware
-            guard actualInputChannels > 0 else {
-                throw NSError(domain: "AudioManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "No input channels available"])
-            }
-            
-            // Use actual sample rate from hardware
-            self.inputFormat = AVAudioFormat(
+            // CRITICAL FIX: Create formats based on actual hardware with validation
+            guard let inputFormat = AVAudioFormat(
                 commonFormat: .pcmFormatFloat32,
                 sampleRate: actualSampleRate,
                 channels: 1,
                 interleaved: true
-            )
+            ) else {
+                throw NSError(
+                    domain: "AudioManager",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to create input format"]
+                )
+            }
             
-            self.audioFormat = AVAudioFormat(
+            guard let audioFormat = AVAudioFormat(
                 commonFormat: .pcmFormatFloat32,
                 sampleRate: actualSampleRate,
                 channels: 2,
                 interleaved: false
-            )
+            ) else {
+                throw NSError(
+                    domain: "AudioManager",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to create audio format"]
+                )
+            }
             
-            self.webSocketFormat = AVAudioFormat(
+            guard let webSocketFormat = AVAudioFormat(
                 commonFormat: .pcmFormatInt16,
                 sampleRate: targetSampleRate,
                 channels: 1,
                 interleaved: true
-            )
-            
-            // Validate formats
-            guard let inputFormat = self.inputFormat,
-                  let audioFormat = self.audioFormat,
-                  let webSocketFormat = self.webSocketFormat else {
-                throw NSError(domain: "AudioManager", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to create valid audio formats"])
+            ) else {
+                throw NSError(
+                    domain: "AudioManager",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to create webSocket format"]
+                )
             }
+            
+            // Assign validated formats
+            self.inputFormat = inputFormat
+            self.audioFormat = audioFormat
+            self.webSocketFormat = webSocketFormat
             
             print("✅ Audio formats created successfully")
             print("   Input: \(inputFormat)")
