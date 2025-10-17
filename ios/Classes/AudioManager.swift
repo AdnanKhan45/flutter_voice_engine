@@ -401,14 +401,14 @@ public class AudioManager {
             isEngineSetup = false
         }
         
-        // Deactivate audio session (does not touch music players; they use AVPlayer)
-        do {
-            try AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-        } catch {
-            print("Failed to deactivate audio session in stop(): \(error)")
-        }
+        // IMPORTANT: Do NOT deactivate the shared audio session here.
+        // Music relies on the same session; deactivation would pause/kill it.
+        // If you ever want to deactivate only when no music is playing:
+        // if !musicIsPlaying && queuePlayer.rate == 0 {
+        //     try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+        // }
         
-        print("Stop completed (bot + engine stopped, music untouched)")
+        print("Stop completed (bot + engine stopped, music untouched, session kept active)")
     }
     
     // CRITICAL FIX: Simpler configuration change handling
