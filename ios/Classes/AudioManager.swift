@@ -234,58 +234,69 @@ public class AudioManager {
         print("✅ Converters initialized successfully")
     }
     
-    // CRITICAL FIX: Safer tap installation
     private func installRecordingTap() {
         let bus = 0
         inputNode.removeTap(onBus: bus)
-        
-        guard let converter = recordingConverter else {
-            print("❌ Cannot install tap: missing converter")
+
+        // Ensure we have a converter target and a valid input format
+        guard let wsFormat = webSocketFormat else {
+            print("❌ Cannot install tap: webSocketFormat is nil")
             return
         }
-        
-        // Use input node's actual format
+
         let tapFormat = inputNode.inputFormat(forBus: bus)
-        print("📊 Installing tap with format: \(tapFormat)")
-        
-        // CRITICAL FIX: If format changed, recreate converter
-        if tapFormat != inputFormat {
-            print("⚠️ Format mismatch, recreating converter")
-            recordingConverter = AVAudioConverter(from: tapFormat, to: webSocketFormat!)
+        guard tapFormat.channelCount > 0, tapFormat.sampleRate > 0 else {
+            print("❌ Refusing to install tap: invalid input format \(tapFormat)")
+            return
+        }
+
+        // Recreate converter if the input format changed
+        if recordingConverter == nil || tapFormat != inputFormat {
+            print("⚠️ Format mismatch or converter missing, recreating recording converter")
+            recordingConverter = AVAudioConverter(from: tapFormat, to: wsFormat)
             guard recordingConverter != nil else {
-                print("❌ Failed to recreate recording converter")
+                print("❌ Failed to create recording converter")
                 return
             }
+            inputFormat = tapFormat
         }
-        
+
         inputNode.installTap(onBus: bus, bufferSize: 4096, format: tapFormat) { [weak self] buffer, _ in
             self?.processRecordingBuffer(buffer)
         }
-        
-        print("✅ Recording tap installed successfully")
+        print("✅ Recording tap installed successfully (format \(tapFormat))")
     }
     
+    // AudioManager.swift
     private func processRecordingBuffer(_ buffer: AVAudioPCMBuffer) {
+        // Skip empty buffers (can happen during route changes/interruptions)
+        guard buffer.frameLength > 0 else { return }
         guard let converter = recordingConverter else { return }
-        
-        let frameCapacity = UInt32(round(Double(buffer.frameLength) * converter.outputFormat.sampleRate / buffer.format.sampleRate))
-        
-        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: frameCapacity) else {
-            return
-        }
-        
+
+        // Compute safe output capacity (never 0)
+        let inSR = buffer.format.sampleRate
+        let outSR = converter.outputFormat.sampleRate
+        let ratio = (inSR > 0) ? (outSR / inSR) : 1.0
+        let estFrames = Double(buffer.frameLength) * max(0.0001, ratio)
+        let frameCapacity = AVAudioFrameCount(max(1, Int(estFrames.rounded())))
+
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: converter.outputFormat,
+                                                  frameCapacity: frameCapacity) else { return }
+
         var error: NSError?
         let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
             outStatus.pointee = .haveData
             return buffer
         }
-        
-        guard error == nil, status != .error, let data = outputBuffer.int16ChannelData?.pointee else {
-            return
-        }
-        
-        let byteCount = Int(outputBuffer.frameLength) * MemoryLayout<Int16>.size * Int(outputBuffer.format.channelCount)
-        let audioData = Data(bytes: data, count: byteCount)
+
+        // Drop invalid/empty conversions
+        guard error == nil, status != .error, outputBuffer.frameLength > 0 else { return }
+        guard let dataPtr = outputBuffer.int16ChannelData?.pointee else { return }
+
+        let byteCount = Int(outputBuffer.frameLength) *
+                        MemoryLayout<Int16>.size *
+                        Int(outputBuffer.format.channelCount)
+        let audioData = Data(bytes: dataPtr, count: byteCount)
         audioChunkPublisher.send(audioData)
     }
     
@@ -308,46 +319,57 @@ public class AudioManager {
         print("Recording stopped")
     }
     
+    // AudioManager.swift
     public func playAudioChunk(audioData: Data) throws {
         guard audioEngine.isRunning, let converter = playbackConverter else {
-            throw NSError(domain: "AudioManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "Engine or converter unavailable"])
+            throw NSError(domain: "AudioManager", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Engine or converter unavailable"])
         }
-        
-        let frameCount = AVAudioFrameCount(audioData.count / (MemoryLayout<Int16>.size * Int(webSocketFormat!.channelCount)))
-        
-        guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: webSocketFormat!, frameCapacity: frameCount) else {
-            throw NSError(domain: "AudioManager", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to create input buffer"])
+        guard let wsFormat = webSocketFormat, let outFormat = audioFormat else {
+            throw NSError(domain: "AudioManager", code: -2,
+                          userInfo: [NSLocalizedDescriptionKey: "Formats not initialized"])
         }
-        
+
+        // Validate chunk size → whole frames and non-zero
+        let bytesPerFrame = MemoryLayout<Int16>.size * Int(wsFormat.channelCount)
+        guard audioData.count >= bytesPerFrame, audioData.count % bytesPerFrame == 0 else {
+            throw NSError(domain: "AudioManager", code: -10,
+                          userInfo: [NSLocalizedDescriptionKey: "Invalid audio chunk size"])
+        }
+
+        let frameCount = AVAudioFrameCount(audioData.count / bytesPerFrame)
+        guard frameCount > 0 else { return }
+
+        guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: wsFormat, frameCapacity: frameCount) else {
+            throw NSError(domain: "AudioManager", code: -3,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to create input buffer"])
+        }
         inputBuffer.frameLength = frameCount
-        audioData.withUnsafeBytes { rawBuffer in
+        audioData.withUnsafeBytes { raw in
             inputBuffer.int16ChannelData?.pointee.update(
-                from: rawBuffer.baseAddress!.assumingMemoryBound(to: Int16.self),
-                count: Int(frameCount * webSocketFormat!.channelCount)
+                from: raw.baseAddress!.assumingMemoryBound(to: Int16.self),
+                count: Int(frameCount * wsFormat.channelCount)
             )
         }
-        
-        let outputFrameCapacity = UInt32(round(Double(frameCount) * audioFormat!.sampleRate / webSocketFormat!.sampleRate))
-        
-        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: audioFormat!, frameCapacity: outputFrameCapacity) else {
-            throw NSError(domain: "AudioManager", code: -4, userInfo: [NSLocalizedDescriptionKey: "Failed to create output buffer"])
+
+        // Safe output capacity (never 0)
+        let ratio = outFormat.sampleRate / wsFormat.sampleRate
+        let outCap = AVAudioFrameCount(max(1, Int((Double(frameCount) * ratio).rounded())))
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: outCap) else {
+            throw NSError(domain: "AudioManager", code: -4,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to create output buffer"])
         }
-        
+
         var error: NSError?
         let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
             outStatus.pointee = .haveData
             return inputBuffer
         }
-        
         if let error = error { throw error }
-        if status == .error {
-            throw NSError(domain: "AudioManager", code: -5, userInfo: [NSLocalizedDescriptionKey: "Playback conversion failed"])
-        }
-        
+        guard status != .error, outputBuffer.frameLength > 0 else { return }
+
         playerNode.scheduleBuffer(outputBuffer, completionHandler: nil)
-        if !playerNode.isPlaying {
-            playerNode.play()
-        }
+        if !playerNode.isPlaying { playerNode.play() }
     }
     
     public func stopPlayback() {
@@ -411,13 +433,18 @@ public class AudioManager {
         print("Stop completed (bot + engine stopped, music untouched, session kept active)")
     }
     
-    // CRITICAL FIX: Simpler configuration change handling
     public func handleConfigurationChange() {
         print("⚠️ Audio engine configuration changed")
-        
+
+        // Ensure any old tap is removed before reconfiguring
+        inputNode.removeTap(onBus: 0)
+
+        if playerNode.isPlaying { playerNode.stop() }
+        playerNode.reset()
+
         if !audioEngine.isRunning && isEngineSetup {
-            print("Engine stopped, restarting...")
-            setupEngine()
+            print("Engine stopped, restarting…")
+            setupEngine()   // will recreate formats & converters safely
         }
     }
     
